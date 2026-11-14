@@ -1,0 +1,48 @@
+# UCM PD Router 配置示例
+#
+# v4 边界：Router 只做节点选择与请求生命周期管理，不感知 KV 缓存 / Hash / 预取。
+# 因此这里没有任何缓存相关的配置项（如命中阈值、预取水位）——那些属于 UCM 侧。
+
+server:
+  host: 0.0.0.0
+  port: 9000
+
+# Decode 请求下发时序：
+#   sequential — P 的 prefill 完成（HTTP 响应返回）后，再把 Decode 请求发给 D。
+#                与 UCM 官方 toy_proxy_server.py 同语义，正确性最稳妥。
+#   early      — 选完 P/D 后尽快把 Decode 请求发给 D，不等 P 完成；
+#                KV 就绪等待发生在 D 侧 UCM Connector（v4 理想路径，
+#                依赖 Connector 的请求级就绪等待能力，见 README"待验证前提"）。
+decode_dispatch: sequential
+
+# ServingGroup：一组 KV 兼容的 P/D 实例。模型版本、Tokenizer、KV 数据类型、
+# KV Layout、并行配置不一致的节点不能配成一组。
+routing:
+  # 每节点在途请求上限；0 = 不限。到上限后该节点不再接新请求，
+  # 全部节点到上限时返回 429（PREFILL/DECODE_AT_CAPACITY）。
+  # 运行时可用 admin API 增删节点：POST/DELETE /admin/nodes（不持久化）。
+  max_inflight_per_node: 0
+  # 会话亲和（Rendezvous/HRW 哈希）：同一会话稳定落到同一组 P/D，
+  # 提升多轮对话的 KV 复用。key 来自请求元数据：user 字段 > X-Session-Id 头
+  # > model+前置system消息+第一条user消息。确定性放置，不感知 KV 状态（v4 边界内）。
+  session_affinity: false
+  serving_groups:
+    - model: "Qwen/Qwen2.5-7B-Instruct"
+      prefill:
+        - "http://127.0.0.1:7800"
+      decode:
+        - "http://127.0.0.1:7801"
+
+# 对后端引擎的 HTTP 超时（OpenAI 兼容接口）
+engine:
+  connect_timeout_seconds: 5
+  prefill_timeout_seconds: 120   # 等 P 完成 prefill 的上限
+  decode_timeout_seconds: 300    # decode 流上相邻字节间的空闲上限
+
+# 周期探测各节点 GET /health；不健康节点移出轮询，恢复后加回
+health:
+  interval_seconds: 5
+  timeout_seconds: 2
+  # admin 动态添加的节点若探测未通过，进等待队列按 interval 轮询，
+  # 就绪后自动激活；超过 waiting_max_retries 轮放弃
+  waiting_max_retries: 12
