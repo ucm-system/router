@@ -1,155 +1,113 @@
-"""Router 自有指标：手写的极简 Prometheus 文本 exposition（无第三方依赖）。
+"""Router 自有指标：prometheus_client 的 Counter / Gauge / Histogram。
 
-边界：router 只报自己视角的事——选路、请求生命周期、耗时、错误。KV 命中与
-等待属于 UCM Connector 的知识，router 不自己统计，而是抓取实例 /metrics 改名
-透传（见 metrics_proxy）；唯一近似例外是 pd_recomputed_total，它取自引擎响应的
-stop_reason 信号，router 只识别并计数，不判断缓存状态。
+不自己写 exposition。vLLM 的 requirements/common.txt 里就有
+`prometheus_client >= 0.18.0`，UCM 的 connector 指标也是经 vLLM 的 Prometheus
+桥导出的；Router 和引擎跑在同一套环境里，用同一个库，文本格式、标签转义、
+分桶语义都跟着标准走，不必在这三处重复实现。
+
+只用私有 CollectorRegistry，不用库默认的 REGISTRY：默认那个挂着 process_* /
+python_* 一组采集器，而本项目的 /metrics 还要与 P/D 抓来的 exposition 合并，
+塞一堆进程噪声进去没有意义（要的话 main.py 里换成默认 registry 即可）。
+
+耗时类是 Histogram 而不是 sum/count 对：Prometheus 侧能直接出分位数。
 """
 
 from __future__ import annotations
 
-from typing import Iterator
+from prometheus_client import (
+    CollectorRegistry,
+    Counter,
+    Gauge,
+    Histogram,
+    generate_latest,
+)
 
-LabelKey = tuple[tuple[str, str], ...]
-
-
-def _label_key(labels: dict[str, str] | None) -> LabelKey:
-    return tuple(sorted((labels or {}).items()))
-
-
-def _escape(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
-
-
-def _render_labels(labels: LabelKey) -> str:
-    if not labels:
-        return ""
-    inner = ",".join(f'{k}="{_escape(v)}"' for k, v in labels)
-    return f"{{{inner}}}"
-
-
-class _Family:
-    def __init__(self, name: str, help_text: str, metric_type: str) -> None:
-        self.name = name
-        self.help = help_text
-        self.type = metric_type
-        self.samples: dict[LabelKey, float] = {}
-
-    def _render(self) -> Iterator[str]:
-        yield f"# HELP {self.name} {self.help}"
-        yield f"# TYPE {self.name} {self.type}"
-        for key in sorted(self.samples):
-            yield f"{self.name}{_render_labels(key)} {_format_value(self.samples[key])}"
-
-
-def _format_value(value: float) -> str:
-    if value == int(value) and abs(value) < 1e15:
-        return str(int(value))
-    return repr(value)
-
-
-class Counter:
-    def __init__(self, family: _Family) -> None:
-        self._family = family
-
-    def inc(self, labels: dict[str, str] | None = None, amount: float = 1.0) -> None:
-        key = _label_key(labels)
-        self._family.samples[key] = self._family.samples.get(key, 0.0) + amount
-
-
-class Gauge:
-    def __init__(self, family: _Family) -> None:
-        self._family = family
-
-    def set(self, labels: dict[str, str], value: float) -> None:
-        self._family.samples[_label_key(labels)] = value
-
-    def get(self, labels: dict[str, str]) -> float:
-        return self._family.samples.get(_label_key(labels), 0.0)
-
-
-class Timing:
-    """sum/count 对：够用的耗时观测，不引入 histogram 分桶。"""
-
-    def __init__(self, total: Counter, count: Counter) -> None:
-        self._total = total
-        self._count = count
-
-    def observe(self, labels: dict[str, str], seconds: float) -> None:
-        self._total.inc(labels, seconds)
-        self._count.inc(labels)
-
-
-class MetricsRegistry:
-    def __init__(self) -> None:
-        self._families: list[_Family] = []
-
-    def _family(self, name: str, help_text: str, metric_type: str) -> _Family:
-        family = _Family(name, help_text, metric_type)
-        self._families.append(family)
-        return family
-
-    def counter(self, name: str, help_text: str) -> Counter:
-        return Counter(self._family(name, help_text, "counter"))
-
-    def gauge(self, name: str, help_text: str) -> Gauge:
-        return Gauge(self._family(name, help_text, "gauge"))
-
-    def timing(self, name: str, help_text: str) -> Timing:
-        return Timing(
-            self.counter(f"{name}_sum", help_text),
-            self.counter(f"{name}_count", f"number of {name} observations"),
-        )
-
-    def render(self) -> str:
-        lines: list[str] = []
-        for family in self._families:
-            lines.extend(family._render())
-        return "\n".join(lines) + "\n"
+# 秒级分桶：从毫秒级的建流等待铺到分钟级的长 prompt prefill。
+# 上限取 300s，与 engine.decode_timeout_seconds 的默认值对齐。
+DURATION_BUCKETS: tuple[float, ...] = (
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+    10.0, 30.0, 60.0, 120.0, 300.0,
+)
 
 
 class RouterMetrics:
-    """Router 自有指标集合。"""
+    """Router 自有指标集合。
 
-    def __init__(self, registry: MetricsRegistry) -> None:
-        self.requests = registry.counter(
-            "pd_requests_total", "requests by model/dispatch/outcome")
-        self.failures = registry.counter(
-            "pd_failures_total", "failed requests by error code")
-        self.selections = registry.counter(
-            "pd_node_selections_total", "node selections by role/instance")
-        self.retries = registry.counter(
-            "pd_retries_total", "in-request failover retries by role")
-        self.recomputed = registry.counter(
+    标签名按字母序声明，exposition 里输出的顺序与声明顺序一致，
+    方便和 README 里的指标表、既有看板对齐。
+    """
+
+    def __init__(self) -> None:
+        self.registry = CollectorRegistry()
+        reg = self.registry
+
+        self.requests = Counter(
+            "pd_requests_total",
+            "requests by model/dispatch/outcome",
+            ["dispatch", "model", "outcome"], registry=reg)
+        self.failures = Counter(
+            "pd_failures_total",
+            "failed requests by error code",
+            ["code"], registry=reg)
+        self.selections = Counter(
+            "pd_node_selections_total",
+            "node selections by role/instance",
+            ["instance", "role"], registry=reg)
+        self.retries = Counter(
+            "pd_retries_total",
+            "in-request failover retries by role",
+            ["role"], registry=reg)
+        self.recomputed = Counter(
             "pd_recomputed_total",
             "decode requests where the engine fell back to recompute "
-            "(vLLM stop_reason=recomputed; D 侧 KV 等待超时/失败的关键观测点)")
-        self.scrape_failures = registry.counter(
-            "pd_scrape_failures_total", "backend /metrics scrape failures by role/instance")
-        self.stream_bytes = registry.counter(
-            "pd_stream_bytes_total", "bytes proxied from decode nodes by model")
-        self.prefill_duration = registry.timing(
-            "pd_prefill_duration_seconds", "prefill phase duration including failover retries")
-        self.ttft = registry.timing(
-            "pd_ttft_seconds", "router-observed time to first byte from decode (incl. prefill)")
-        self.dispatch_lead = registry.timing(
+            "(vLLM stop_reason=recomputed; D 侧 KV 等待超时/失败的关键观测点)",
+            ["model"], registry=reg)
+        self.scrape_failures = Counter(
+            "pd_scrape_failures_total",
+            "backend /metrics scrape failures by role/instance",
+            ["instance", "role"], registry=reg)
+        self.stream_bytes = Counter(
+            "pd_stream_bytes_total",
+            "bytes proxied from decode nodes by model",
+            ["model"], registry=reg)
+
+        self.prefill_duration = Histogram(
+            "pd_prefill_duration_seconds",
+            "prefill phase duration including failover retries",
+            ["model"], buckets=DURATION_BUCKETS, registry=reg)
+        self.ttft = Histogram(
+            "pd_ttft_seconds",
+            "router-observed time to first byte from decode (incl. prefill)",
+            ["model"], buckets=DURATION_BUCKETS, registry=reg)
+        self.dispatch_lead = Histogram(
             "pd_early_dispatch_lead_seconds",
-            "early 模式下 decode 先于 prefill 完成下发的时长（等待被 P 计算掩盖的量）")
-        self.sessions_active = registry.gauge(
-            "pd_sessions_active", "in-flight sessions per node")
-        self.pool_healthy = registry.gauge(
-            "pd_pool_healthy", "healthy node count per pool")
+            "early 模式下从选路完成到 P 返回、D 建好响应流的时长（被 P 计算掩盖的等待上界）",
+            ["model"], buckets=DURATION_BUCKETS, registry=reg)
+
+        self.sessions_active = Gauge(
+            "pd_sessions_active",
+            "in-flight sessions per node",
+            ["instance", "role"], registry=reg)
+        self.pool_healthy = Gauge(
+            "pd_pool_healthy",
+            "healthy node count per pool",
+            ["model", "role"], registry=reg)
+
+    def render(self) -> str:
+        """Router 自有指标的 exposition 文本（不含 P/D 抓来的部分）。"""
+        return generate_latest(self.registry).decode()
 
     def sync_pools(self, provider) -> None:
         """把 NodePool 的实时状态刷进 gauge（在选路/释放/健康探测/增删节点后调用）。"""
         for group in provider.groups():
             for pool in (group.prefill_pool, group.decode_pool):
                 for node in pool.nodes:
-                    self.sessions_active.set(
-                        {"role": pool.role, "instance": node.base_url},
-                        pool.inflight.get(node.base_url, 0),
-                    )
-                self.pool_healthy.set(
-                    {"model": group.model, "role": pool.role},
-                    len(pool.healthy_nodes()),
-                )
+                    self.sessions_active.labels(
+                        instance=node.base_url, role=pool.role,
+                    ).set(pool.inflight.get(node.base_url, 0))
+                self.pool_healthy.labels(
+                    model=group.model, role=pool.role,
+                ).set(len(pool.healthy_nodes()))
+
+
+__all__ = ["DURATION_BUCKETS", "RouterMetrics"]

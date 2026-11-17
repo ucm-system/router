@@ -15,6 +15,8 @@ from tests.conftest import (
     make_router,
 )
 
+from ucm_router.metrics import DURATION_BUCKETS
+
 
 async def stats(http: httpx.AsyncClient, server) -> dict:
     return (await http.get(f"{server.url}/stats")).json()
@@ -229,13 +231,26 @@ async def test_metrics_own_and_pd_passthrough(servers, store_dir, http):
 
     text = (await http.get(f"{router.url}/metrics")).text
 
-    # 自有指标：请求成败、节点选择、在途、池健康、TTFT
-    assert 'pd_requests_total{dispatch="sequential",model="mock-model",outcome="ok"} 1' in text
-    assert f'pd_node_selections_total{{instance="{prefill.url}",role="prefill"}} 1' in text
-    assert f'pd_node_selections_total{{instance="{decode.url}",role="decode"}} 1' in text
-    assert f'pd_sessions_active{{instance="{prefill.url}",role="prefill"}} 0' in text
-    assert 'pd_pool_healthy{model="mock-model",role="decode"} 1' in text
-    assert "pd_ttft_seconds_count{model=" in text
+    # 自有指标：请求成败、节点选择、在途、池健康（prometheus_client 按浮点渲染）
+    assert 'pd_requests_total{dispatch="sequential",model="mock-model",outcome="ok"} 1.0' in text
+    assert f'pd_node_selections_total{{instance="{prefill.url}",role="prefill"}} 1.0' in text
+    assert f'pd_node_selections_total{{instance="{decode.url}",role="decode"}} 1.0' in text
+    assert f'pd_sessions_active{{instance="{prefill.url}",role="prefill"}} 0.0' in text
+    assert 'pd_pool_healthy{model="mock-model",role="decode"} 1.0' in text
+
+    # 耗时类是 histogram：分位数直接可算，不是只有 sum/count 一对
+    assert "# TYPE pd_ttft_seconds histogram" in text
+    assert 'pd_ttft_seconds_count{model="mock-model"} 1.0' in text
+    assert 'pd_ttft_seconds_sum{model="mock-model"}' in text
+    bucket_lines = [ln for ln in text.splitlines()
+                    if ln.startswith("pd_ttft_seconds_bucket{")]
+    assert len(bucket_lines) == len(DURATION_BUCKETS) + 1      # 配置的桶 +Inf
+    assert bucket_lines[-1].startswith(
+        'pd_ttft_seconds_bucket{le="+Inf",model="mock-model"} 1.0')
+
+    # 只用私有 CollectorRegistry：默认 registry 的 process_* / python_* 不该混进来
+    assert "process_cpu_seconds_total" not in text
+    assert "python_info" not in text
 
     # PD 分改名合并：同族指标按角色拆成 pd_prefill_* / pd_decode_*，实例靠标签区分
     assert f'pd_prefill_mock_kv_blocks_written_total{{pd_role="prefill",pd_instance="{prefill.url}"}}' in text
@@ -368,7 +383,7 @@ async def test_prefill_failover_to_other_node(servers, store_dir, http):
     assert (await stats(http, p2))["prefill_requests"] == 1
 
     text = (await http.get(f"{router.url}/metrics")).text
-    assert 'pd_retries_total{role="prefill"} 1' in text
+    assert 'pd_retries_total{role="prefill"} 1.0' in text
 
 
 async def test_passive_health_marks_unreachable_node(servers, store_dir, http):
@@ -446,7 +461,7 @@ async def test_mid_stream_interrupt_is_recorded(servers, store_dir, http):
     assert "[DONE]" not in "".join(chunks)
 
     text = (await http.get(f"{router.url}/metrics")).text
-    assert 'pd_failures_total{code="DECODE_STREAM_INTERRUPTED"} 1' in text
+    assert 'pd_failures_total{code="DECODE_STREAM_INTERRUPTED"} 1.0' in text
 
 
 # --- ⑪ 对标 vllm-ascend toy proxy 吸收的行为 ---------------------------------
@@ -567,7 +582,7 @@ async def test_recomputed_detection(servers, store_dir, http):
             pass
 
     text = (await http.get(f"{router.url}/metrics")).text
-    assert 'pd_recomputed_total{model="mock-model"} 2' in text
+    assert 'pd_recomputed_total{model="mock-model"} 2.0' in text
 
 
 async def test_v1_models_and_reset_prefix_cache(servers, store_dir, http):

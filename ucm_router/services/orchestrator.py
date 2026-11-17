@@ -99,10 +99,10 @@ class Orchestrator:
                 self._health.mark_unreachable(exc.node)
             session.phase = RequestPhase.FAILED
             self._release(session)
-            self._metrics.requests.inc(
-                {"model": session.model, "dispatch": self._dispatch, "outcome": "failed"})
+            self._metrics.requests.labels(
+                model=session.model, dispatch=self._dispatch, outcome="failed").inc()
             if isinstance(exc, RouterError):
-                self._metrics.failures.inc({"code": exc.code})
+                self._metrics.failures.labels(code=exc.code).inc()
             raise
 
     def _session_key(self, payload: dict, headers) -> str | None:
@@ -217,8 +217,8 @@ class Orchestrator:
             if decode is not None:
                 await decode.aclose()
             raise
-        self._metrics.dispatch_lead.observe(
-            {"model": session.model}, time.monotonic() - dispatch_started)
+        self._metrics.dispatch_lead.labels(model=session.model).observe(
+            time.monotonic() - dispatch_started)
         session.record_prefill_finished()
         return decode, assignment, prefill_body
 
@@ -230,8 +230,8 @@ class Orchestrator:
             session, assignment, ROLE_PREFILL,
             lambda node: self._engine.submit_prefill(node, path, payload, session.request_id),
         )
-        self._metrics.prefill_duration.observe(
-            {"model": session.model}, time.monotonic() - started)
+        self._metrics.prefill_duration.labels(model=session.model).observe(
+            time.monotonic() - started)
         logger.info(
             "req=%s prefill ok on %s in %.3fs",
             session.request_id, session.prefill_node, time.monotonic() - started)
@@ -259,7 +259,7 @@ class Orchestrator:
                 logger.warning(
                     "req=%s %s node %s failed (%s), failing over to %s",
                     session.request_id, role, node.base_url, exc.message, new_node.base_url)
-                self._metrics.retries.inc({"role": role})
+                self._metrics.retries.labels(role=role).inc()
                 assignment = self._swap_node(session, assignment, role, new_node)
                 node = new_node
 
@@ -268,10 +268,10 @@ class Orchestrator:
     def _acquire(self, session, assignment) -> None:
         assignment.group.prefill_pool.acquire(assignment.prefill_node.base_url)
         assignment.group.decode_pool.acquire(assignment.decode_node.base_url)
-        self._metrics.selections.inc(
-            {"role": ROLE_PREFILL, "instance": assignment.prefill_node.base_url})
-        self._metrics.selections.inc(
-            {"role": ROLE_DECODE, "instance": assignment.decode_node.base_url})
+        self._metrics.selections.labels(
+            instance=assignment.prefill_node.base_url, role=ROLE_PREFILL).inc()
+        self._metrics.selections.labels(
+            instance=assignment.decode_node.base_url, role=ROLE_DECODE).inc()
         self._sync_runtime()
 
     def _swap_node(self, session, assignment, role, new_node: ServingNode):
@@ -280,7 +280,7 @@ class Orchestrator:
         if old_url is not None:
             pool.release(old_url)
         pool.acquire(new_node.base_url)
-        self._metrics.selections.inc({"role": role, "instance": new_node.base_url})
+        self._metrics.selections.labels(instance=new_node.base_url, role=role).inc()
         if role == ROLE_PREFILL:
             session.prefill_node = new_node.base_url
             assignment = replace(assignment, prefill_node=new_node)
@@ -337,27 +337,27 @@ class Orchestrator:
             async for chunk in self._stream_chunks(decode, first_chunk):
                 if session.first_byte_at is None:
                     session.record_first_byte()
-                    self._metrics.ttft.observe({"model": session.model}, session.ttft_seconds or 0.0)
+                    self._metrics.ttft.labels(model=session.model).observe(session.ttft_seconds or 0.0)
                     logger.info(
                         "req=%s first byte from %s, ttft=%.3fs",
                         session.request_id, session.decode_node, session.ttft_seconds,
                     )
-                self._metrics.stream_bytes.inc({"model": session.model}, len(chunk))
+                self._metrics.stream_bytes.labels(model=session.model).inc(len(chunk))
                 # recomputed 启发式：字节级透传不解析 SSE，仅做廉价子串门检
                 # （finish chunk 同时含 "stop_reason" 与 "recomputed"）。
                 # 误报需要模型正文恰好生成 JSON 字面量，可忽略；这正是
                 # D 侧 KV 等待超时回退重算的信号（就绪等待与兜底那两条前提的失败率观测点）。
                 if not recomputed_seen and b'"stop_reason"' in chunk and b"recomputed" in chunk:
                     recomputed_seen = True
-                    self._metrics.recomputed.inc({"model": session.model})
+                    self._metrics.recomputed.labels(model=session.model).inc()
                     logger.warning(
                         "req=%s decode side reported recomputed: KV wait fell back to recompute",
                         session.request_id,
                     )
                 yield chunk
             session.phase = RequestPhase.COMPLETED
-            self._metrics.requests.inc(
-                {"model": session.model, "dispatch": self._dispatch, "outcome": "ok"})
+            self._metrics.requests.labels(
+                model=session.model, dispatch=self._dispatch, outcome="ok").inc()
             logger.info(
                 "req=%s stream complete in %.3fs",
                 session.request_id, session.elapsed_seconds(),
@@ -365,9 +365,9 @@ class Orchestrator:
         except Exception as exc:
             # 流已开始（200 已发出），只能记录与计数，无法改写响应状态
             session.phase = RequestPhase.FAILED
-            self._metrics.failures.inc({"code": "DECODE_STREAM_INTERRUPTED"})
-            self._metrics.requests.inc(
-                {"model": session.model, "dispatch": self._dispatch, "outcome": "failed"})
+            self._metrics.failures.labels(code="DECODE_STREAM_INTERRUPTED").inc()
+            self._metrics.requests.labels(
+                model=session.model, dispatch=self._dispatch, outcome="failed").inc()
             logger.error(
                 "req=%s stream interrupted from %s after %.3fs: %r",
                 session.request_id, session.decode_node, session.elapsed_seconds(), exc,
@@ -387,10 +387,10 @@ class Orchestrator:
         try:
             body = await decode.read_all()
             session.record_first_byte()
-            self._metrics.ttft.observe({"model": session.model}, session.ttft_seconds or 0.0)
+            self._metrics.ttft.labels(model=session.model).observe(session.ttft_seconds or 0.0)
             session.phase = RequestPhase.COMPLETED
-            self._metrics.requests.inc(
-                {"model": session.model, "dispatch": self._dispatch, "outcome": "ok"})
+            self._metrics.requests.labels(
+                model=session.model, dispatch=self._dispatch, outcome="ok").inc()
             logger.info(
                 "req=%s response complete in %.3fs",
                 session.request_id, session.elapsed_seconds(),
@@ -425,7 +425,7 @@ class Orchestrator:
             for choice in data.get("choices") or []
         )
         if recomputed:
-            self._metrics.recomputed.inc({"model": session.model})
+            self._metrics.recomputed.labels(model=session.model).inc()
             logger.warning(
                 "req=%s decode side reported recomputed: KV wait fell back to recompute",
                 session.request_id,

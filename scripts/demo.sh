@@ -143,8 +143,10 @@ echo "[demo] router 池健康："
 curl -s "http://127.0.0.1:${ROUTER_PORT}/health"
 echo
 echo
-echo "[demo] /metrics（自有指标 + PD 分改名合并，节选）："
-curl -s "http://127.0.0.1:${ROUTER_PORT}/metrics" | grep -E "^pd_(requests_total|ttft_seconds_count|early_dispatch_lead_seconds_count|retries_total|prefill_duration_seconds_count|pool_healthy|decode_mock_router_hint_seen_total)" | head -14
+echo "[demo] /metrics（自有指标 + PD 分改名合并，节选；耗时类是带分桶的 histogram）："
+METRICS="$(curl -s "http://127.0.0.1:${ROUTER_PORT}/metrics")"
+echo "$METRICS" | grep -E "^pd_(requests_total|retries_total|prefill_duration_seconds_count|pool_healthy|decode_mock_router_hint_seen_total)"
+echo "$METRICS" | grep -E '^pd_ttft_seconds_(bucket\{le="(0\.25|1|\+Inf)"|count|sum)' | head -6
 echo
 echo "[demo] /admin/nodes（动态增删节点的查询入口）："
 curl -s "http://127.0.0.1:${ROUTER_PORT}/admin/nodes"

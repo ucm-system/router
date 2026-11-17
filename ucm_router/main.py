@@ -18,7 +18,7 @@ from ucm_router.errors import (
     NoServingGroup,
     RouterError,
 )
-from ucm_router.metrics import MetricsRegistry, RouterMetrics
+from ucm_router.metrics import RouterMetrics
 from ucm_router.ports.engine_client import VllmOpenAIClient
 from ucm_router.ports.node_provider import StaticNodeProvider
 from ucm_router.ports.session_repository import InMemorySessionRepository
@@ -34,14 +34,13 @@ PROMETHEUS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
 
 def create_app(config: RouterConfig) -> FastAPI:
     provider = StaticNodeProvider(config)
-    registry = MetricsRegistry()
-    metrics = RouterMetrics(registry)
+    metrics = RouterMetrics()
     metrics.sync_pools(provider)
     scheduler = Scheduler()
     sessions = InMemorySessionRepository()
     engine = VllmOpenAIClient(config.engine)
     health = HealthChecker(provider, config.health, metrics)
-    metrics_proxy = MetricsProxy(provider, registry, metrics)
+    metrics_proxy = MetricsProxy(provider, metrics)
     orchestrator = Orchestrator(
         provider, scheduler, engine, sessions, health, config, metrics)
 

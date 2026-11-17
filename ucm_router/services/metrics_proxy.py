@@ -16,7 +16,7 @@ import httpx
 
 from ucm_router.domain.routing import ServingNode
 from ucm_router.ports.node_provider import NodeProvider
-from ucm_router.metrics import MetricsRegistry, RouterMetrics
+from ucm_router.metrics import RouterMetrics
 
 logger = logging.getLogger("ucm_router.metrics_proxy")
 
@@ -49,16 +49,15 @@ def rewrite_scraped(text: str, role: str, instance: str) -> str:
 
 class MetricsProxy:
     def __init__(
-        self, provider: NodeProvider, registry: MetricsRegistry, metrics: RouterMetrics,
+        self, provider: NodeProvider, metrics: RouterMetrics
     ) -> None:
         self._provider = provider
-        self._registry = registry
         self._metrics = metrics
         self._client = httpx.AsyncClient()
 
     async def render(self) -> str:
         # Router 自有指标在前，PD 分改名合并的在后
-        sections = [self._registry.render()]
+        sections = [self._metrics.render()]
         nodes = [
             node
             for group in self._provider.groups()
@@ -70,17 +69,18 @@ class MetricsProxy:
         return "\n".join(sections)
 
     async def _scrape(self, node: ServingNode) -> str | None:
-        labels = {"role": node.role, "instance": node.base_url}
         try:
             response = await self._client.get(
                 f"{node.base_url}/metrics", timeout=SCRAPE_TIMEOUT_SECONDS)
         except httpx.HTTPError as exc:
             logger.warning("scrape %s failed: %r", node.base_url, exc)
-            self._metrics.scrape_failures.inc(labels)
+            self._metrics.scrape_failures.labels(
+                instance=node.base_url, role=node.role).inc()
             return None
         if response.status_code >= 400:
             logger.warning("scrape %s returned %d", node.base_url, response.status_code)
-            self._metrics.scrape_failures.inc(labels)
+            self._metrics.scrape_failures.labels(
+                instance=node.base_url, role=node.role).inc()
             return None
         return rewrite_scraped(response.text, node.role, node.base_url)
 

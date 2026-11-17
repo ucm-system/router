@@ -6,7 +6,7 @@ ucm-router 是 [UCM（Unified Cache Manager）](https://github.com/ModelEngine-G
 
 三个角色的分工：Router 决定请求去哪里，UCM 决定 KV 什么时候准备好，引擎决定计算什么时候执行。所以 Router 不持有 Tokenizer，不计算 block hash，不查询缓存，也不编排预取；它会在请求里声明自己编排的是哪条腿、期望哪种 KV 加载意图，但块范围、地址和时机都由 Connector 自己定。命中判断、SSD 到 DRAM 的提升、等待 P 尚未写完的 KV，全部在 D 侧 Connector 里完成。
 
-进程内只有两个领域（Routing、Request）和三个 Port（NodeProvider、EngineClient、SessionRepository），没有数据库、消息队列等外部依赖，单进程即可运行。
+进程内只有两个领域（Routing、Request）和三个 Port（NodeProvider、EngineClient、SessionRepository），没有数据库、消息队列等外部依赖，单进程即可运行。运行依赖只有 FastAPI、uvicorn、httpx、PyYAML 和 `prometheus_client`，后者 vLLM 自己就带着。
 
 已实现：OpenAI 兼容入口与 SSE 字节透传、每池独立的 Round-Robin 选路、健康探测与被动摘除、在途容量上限、同池换节点 failover、preopen、可选会话亲和、发给两腿的 router 编排声明、Prometheus 指标汇总、动态增删节点。
 
@@ -43,7 +43,7 @@ ucm_router/
 ├── main.py                    FastAPI 应用与所有 HTTP 端点（/v1、/health、/metrics、/admin）
 ├── config.py                  YAML 配置加载与启动期校验
 ├── errors.py                  错误类型、错误码与 HTTP 状态码映射
-├── metrics.py                 手写的 Prometheus exposition（counter / gauge / sum+count）
+├── metrics.py                 Router 自有指标（prometheus_client 的 counter / gauge / histogram）
 ├── domain/
 │   ├── routing.py             ServingNode / NodePool / ServingGroup / RouteAssignment
 │   └── request.py             RequestSession 的阶段与时间戳
@@ -271,26 +271,34 @@ INFO 级别下 httpx 会为每一次引擎调用和每一次健康探测各打�
 
 ### GET /metrics
 
-Prometheus 文本格式，由 `metrics.py` 手写渲染，不引入 client 库。Router 自有指标只覆盖选路与请求生命周期：
+Prometheus 文本格式，由 `prometheus_client` 渲染。Router 自有指标只覆盖选路与请求生命周期：
 
 | 指标 | 类型 | 标签 | 含义 |
 | --- | --- | --- | --- |
-| `pd_requests_total` | counter | model, dispatch, outcome | 请求量与成败（outcome: ok / failed） |
+| `pd_requests_total` | counter | dispatch, model, outcome | 请求量与成败（outcome: ok / failed） |
 | `pd_failures_total` | counter | code | 按错误码细分的失败，含 `DECODE_STREAM_INTERRUPTED` |
-| `pd_node_selections_total` | counter | role, instance | 各节点被选中的次数，用来检查 RR 是否公平 |
+| `pd_node_selections_total` | counter | instance, role | 各节点被选中的次数，用来检查 RR 是否公平 |
 | `pd_retries_total` | counter | role | 同池换节点 failover 次数 |
 | `pd_recomputed_total` | counter | model | D 侧等待 KV 回退重算的次数 |
-| `pd_prefill_duration_seconds_sum` / `_count` | counter | model | P 段耗时（含重试） |
-| `pd_ttft_seconds_sum` / `_count` | counter | model | Router 视角的 TTFT，含 prefill |
-| `pd_early_dispatch_lead_seconds_sum` / `_count` | counter | model | early 模式下从选路到 P 完成、D 已建流的时长 |
-| `pd_sessions_active` | gauge | role, instance | 每节点在途请求数 |
+| `pd_prefill_duration_seconds` | histogram | model | P 段耗时（含重试） |
+| `pd_ttft_seconds` | histogram | model | Router 视角的 TTFT，含 prefill |
+| `pd_early_dispatch_lead_seconds` | histogram | model | early 模式下从选路到 P 完成、D 已建流的时长 |
+| `pd_sessions_active` | gauge | instance, role | 每节点在途请求数 |
 | `pd_pool_healthy` | gauge | model, role | 每池健康节点数 |
 | `pd_stream_bytes_total` | counter | model | 从 D 透传出去的字节数 |
-| `pd_scrape_failures_total` | counter | role, instance | 抓取实例 `/metrics` 失败的次数 |
+| `pd_scrape_failures_total` | counter | instance, role | 抓取实例 `/metrics` 失败的次数 |
 
-耗时类指标只输出 sum/count 一对，没有 histogram 分桶，所以只能算均值。
+三个耗时指标是带分桶的 histogram，桶边界见 `metrics.DURATION_BUCKETS`（5ms 到 300s，上限与 `engine.decode_timeout_seconds` 的默认值对齐），分位数直接可算：
 
-实例侧指标由 `metrics_proxy.py` 并发抓取每个实例的 `/metrics`（3s 超时），把 metric family 改名加上 `pd_{role}_` 前缀并注入 `pd_role`、`pd_instance` 标签后合并输出。改名是必须的：P 和 D 的同名 family 直接合并会让 Prometheus 拒绝整个端点。抓取失败只累加 `pd_scrape_failures_total`，不影响其余部分。
+```promql
+histogram_quantile(0.95, sum by (le) (rate(pd_ttft_seconds_bucket[5m])))
+```
+
+counter 和 histogram 各自附带一条 `_created` 时间序列，是 `prometheus_client` 的标准输出。
+
+用库而不是自己拼 exposition，理由是这个 Router 只会和 vLLM 跑在同一套环境里，而 vLLM 的 `requirements/common.txt` 本身就带着 `prometheus_client >= 0.18`；UCM 的 connector 指标也是经 vLLM 的 Prometheus 桥导出的，同一套格式与语义不必重写一遍，顺带还拿到了 histogram。只使用私有 CollectorRegistry，不碰库的默认 registry，`/metrics` 里因此没有 `process_*` / `python_*` 那组采集器。
+
+实例侧指标由 `metrics_proxy.py` 并发抓取每个实例的 `/metrics`（3s 超时），把 metric family 改名加上 `pd_{role}_` 前缀并注入 `pd_role`、`pd_instance` 标签后合并输出。这一段是文本级改写，没走库的 parser：解析再渲染会把 `_created`、无类型家族这类条目降级成独立的 untyped 家族，而代理该做的是原样搬、只改名字与标签。改名是必须的：P 和 D 的同名 family 直接合并会让 Prometheus 拒绝整个端点。抓取失败只累加 `pd_scrape_failures_total`，不影响其余部分。
 
 `pd_recomputed_total` 是唯一与 KV 相关的指标，但它的来源不是 Router 的判断，而是引擎响应里的 `stop_reason=recomputed`：非流式路径解析 JSON 精确匹配，流式路径在字节流上做子串门检（同一个 chunk 同时包含 `"stop_reason"` 和 `recomputed`）。误报需要模型正文恰好生成这段 JSON 字面量，可以忽略。
 
@@ -298,7 +306,7 @@ Prometheus 文本格式，由 `metrics.py` 手写渲染，不引入 client 库�
 
 ### 安装与启动
 
-需要 Python 3.10 以上，依赖只有 fastapi、uvicorn、httpx、pyyaml。
+需要 Python 3.10 以上，依赖是 fastapi、uvicorn、httpx、pyyaml 和 prometheus_client（最后这个在 vLLM 环境里已经装好了）。
 
 ```bash
 pip install -e ".[dev]"
