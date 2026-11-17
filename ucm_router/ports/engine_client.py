@@ -4,9 +4,24 @@ v4 分工的直接体现：
 - prefill 请求只是普通 OpenAI 请求的改写（stream=False、max_tokens=1），
   响应 body（含 P 的 usage，即 prefill 侧 cached_tokens）返回给编排层用于
   API 契约合并——只做数据管道，不参与任何路由决策；
-- decode 请求原样透传，不注入 kv_transfer_params、不构造预取参数——
-  KV 如何就绪是 UCM Connector 与引擎的事，Router 完全不感知。
+- decode 请求除 router 自身的编排声明外原样透传，不构造预取参数、不填
+  peer 地址——KV 如何就绪是 UCM Connector 与引擎的事，Router 完全不感知。
 - D 的响应做字节级透传（不解析 SSE chunk），Router 不理解语义。
+
+router 声明（engine.router_hint，默认开）：P/D 的启动配置在 kv_both 模式下
+完全相同，实例无法从自身配置知道"这条请求是本次 PD 编排的哪一条腿"，
+connector 也拿不到 HTTP header。所以这条信息只能走 body，落在
+kv_transfer_params.router 这个由 router 拥有的子键里：
+
+    {"execution_role": "prefill"|"decode",
+     "request_id": "<X-Request-Id 的同一个值>",
+     "kv_load": "store_only"|"prefetch_only"}
+
+kv_load 是显式意图而不是让 connector 从角色反推：prefill 腿写 KV 不外推，
+decode 腿预取后自行加载、不推给对端。未知值/整袋都应当被 connector 忽略
+（fail-open），旧引擎不会因为升级 router 而改变行为。
+子键所有权：router 只覆盖 kv_transfer_params.router，客户端伪造的同名子键
+以此为准被替换；袋子里客户端传来的其他键不动，仍然透传。
 """
 
 from __future__ import annotations
@@ -16,7 +31,7 @@ from typing import AsyncIterator, Protocol
 import httpx
 
 from ucm_router.config import EngineConfig
-from ucm_router.domain.routing import ServingNode
+from ucm_router.domain.routing import ROLE_DECODE, ROLE_PREFILL, ServingNode
 from ucm_router.errors import DecodeRequestFailed, PrefillRequestFailed
 
 # 连接级失败：换一个节点重试是有意义的（见 _BackendRequestFailed.retryable）
@@ -79,6 +94,30 @@ def rewrite_for_prefill(payload: dict) -> dict:
     return body
 
 
+KV_LOAD_PREFILL = "store_only"      # prefill 腿：算完落盘，不推给对端
+KV_LOAD_DECODE = "prefetch_only"    # decode 腿：预取加载，不推
+ROUTER_HINT_KEY = "router"
+
+
+def stamp_router_hint(payload: dict, role: str, request_id: str) -> dict:
+    """在 kv_transfer_params.router 里声明本次 PD 编排（返回副本）。
+
+    所有权只覆盖 router 这一个子键：客户端伪造的同名值被替换，袋子里
+    其他键原样透传。kv_transfer_params 不是对象时（客户端乱填）换成只含
+    router 的新袋，不把意外结构交给 connector。
+    """
+    body = dict(payload)
+    raw = body.get("kv_transfer_params")
+    params = dict(raw) if isinstance(raw, dict) else {}
+    params[ROUTER_HINT_KEY] = {
+        "execution_role": role,
+        "request_id": request_id,
+        "kv_load": KV_LOAD_PREFILL if role == ROLE_PREFILL else KV_LOAD_DECODE,
+    }
+    body["kv_transfer_params"] = params
+    return body
+
+
 def _looks_unreachable(response: httpx.Response) -> bool:
     """空 body 的 5xx 视为节点不可达。
 
@@ -124,10 +163,13 @@ class VllmOpenAIClient:
         Connector 的就绪语义兜底，Router 不感知。
         """
         timeout = self._timeout(self._engine.prefill_timeout_seconds)
+        body = rewrite_for_prefill(payload)
+        if self._engine.router_hint:
+            body = stamp_router_hint(body, ROLE_PREFILL, request_id)
         try:
             response = await self._client.post(
                 f"{node.base_url}{path}",
-                json=rewrite_for_prefill(payload),
+                json=body,
                 headers={"X-Request-Id": request_id},
                 timeout=timeout,
             )
@@ -154,12 +196,15 @@ class VllmOpenAIClient:
     async def open_decode(
         self, node: ServingNode, path: str, payload: dict, request_id: str
     ) -> DecodeStream:
-        """向 D 提交原始请求并建立流。decode 请求不带任何缓存/传输参数。"""
+        """向 D 提交请求并建立流。除 router 声明外不改写 body。"""
         timeout = self._timeout(self._engine.decode_timeout_seconds)
+        body = payload
+        if self._engine.router_hint:
+            body = stamp_router_hint(payload, ROLE_DECODE, request_id)
         request = self._client.build_request(
             "POST",
             f"{node.base_url}{path}",
-            json=payload,
+            json=body,
             headers={"X-Request-Id": request_id},
             timeout=timeout,
         )
@@ -217,6 +262,10 @@ class VllmOpenAIClient:
 __all__ = [
     "DecodeStream",
     "EngineClient",
+    "KV_LOAD_DECODE",
+    "KV_LOAD_PREFILL",
+    "ROUTER_HINT_KEY",
     "VllmOpenAIClient",
     "rewrite_for_prefill",
+    "stamp_router_hint",
 ]

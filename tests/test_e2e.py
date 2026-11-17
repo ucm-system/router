@@ -80,7 +80,7 @@ async def test_early_dispatch_d_side_wait(servers, store_dir, http):
     assert body.rstrip().endswith("data: [DONE]")
 
     d = await stats(http, decode)
-    assert d["blocks_waited"] == 2        # D 到达时 KV 未就绪，逐块等待（前提①生效）
+    assert d["blocks_waited"] == 2        # D 到达时 KV 未就绪，逐块等待（Connector 就绪等待生效）
     assert d["blocks_recomputed"] == 0    # 等待在超时内成功，未回退重算
 
 
@@ -551,7 +551,7 @@ async def test_decode_fail_before_first_chunk_returns_real_status(servers, store
 
 
 async def test_recomputed_detection(servers, store_dir, http):
-    """D 侧重算兜底（stop_reason=recomputed）被计数与标记——前提①③失败率的观测点。"""
+    """D 侧重算兜底（stop_reason=recomputed）被计数与标记，这是就绪等待失效时的观测点。"""
     prefill = servers(make_engine(store_dir, "prefill"))
     decode = servers(make_engine(store_dir, "decode", recompute_stop_reason=True))
     router = servers(make_router([(MODEL, [prefill.url], [decode.url])]))
@@ -585,3 +585,91 @@ async def test_v1_models_and_reset_prefix_cache(servers, store_dir, http):
     assert body["reset"] == 2 and body["failed"] == []
 
 
+
+
+# --- ⑫ router 声明：kv_transfer_params.router ----------------------------------
+
+
+async def test_router_hint_declares_leg_role(servers, store_dir, http):
+    """P/D 启动参数相同，角色只能由 router 声明：两腿各拿到自己的 role 与 kv_load。
+
+    客户端伪造的 router 子键以 router 为准被覆盖；袋子里别人的键继续透传。
+    """
+    prefill = servers(make_engine(store_dir, "prefill"))
+    decode = servers(make_engine(store_dir, "decode"))
+    router = servers(make_router([(MODEL, [prefill.url], [decode.url])]))
+
+    payload = chat_payload("hint probe words", stream=False, max_tokens=2)
+    payload["kv_transfer_params"] = {
+        "router": {"execution_role": "decode", "request_id": "req-123",
+                   "kv_load": "push_then_load"},
+        "peer_host": "10.9.9.9",
+    }
+    resp = await http.post(f"{router.url}/v1/chat/completions", json=payload)
+    assert resp.status_code == 200
+    request_id = resp.headers["x-request-id"]
+
+    p_seen = (await http.get(f"{prefill.url}/last_request")).json()
+    d_seen = (await http.get(f"{decode.url}/last_request")).json()
+
+    assert p_seen["kv_transfer_params"]["router"] == {
+        "execution_role": "prefill", "request_id": request_id, "kv_load": "store_only"}
+    assert d_seen["kv_transfer_params"]["router"] == {
+        "execution_role": "decode", "request_id": request_id, "kv_load": "prefetch_only"}
+    assert "req-123" not in str(d_seen) and "push_then_load" not in str(p_seen)
+    # router 不接管别人的键
+    assert p_seen["kv_transfer_params"]["peer_host"] == "10.9.9.9"
+    assert d_seen["kv_transfer_params"]["peer_host"] == "10.9.9.9"
+    # 两腿的其余口径不变：decode 原样，prefill 仍是单 token 改写
+    assert d_seen["max_tokens"] == 2 and d_seen["stream"] is False
+    assert p_seen["max_tokens"] == 1 and p_seen["min_tokens"] == 1
+
+    # 声明被消费的一方自己计数，router 只改名透传，不解析响应字节
+    assert (await stats(http, prefill))["router_hints_seen"] == 1
+    assert (await stats(http, decode))["router_hints_seen"] == 1
+    assert (await stats(http, prefill))["router_hint_mismatch"] == 0
+    text = (await http.get(f"{router.url}/metrics")).text
+    assert f'pd_prefill_mock_router_hint_seen_total{{pd_role="prefill",pd_instance="{prefill.url}"}} 1' in text
+    assert f'pd_decode_mock_router_hint_seen_total{{pd_role="decode",pd_instance="{decode.url}"}} 1' in text
+    assert f'pd_decode_mock_router_hint_mismatch_total{{pd_role="decode",pd_instance="{decode.url}"}} 0' in text
+
+
+async def test_router_hint_disabled_is_pure_passthrough(servers, store_dir, http):
+    """engine.router_hint=false 的回退开关：decode 腿一字不改，伪造值也原样送达。"""
+    prefill = servers(make_engine(store_dir, "prefill"))
+    decode = servers(make_engine(store_dir, "decode"))
+    router = servers(make_router([(MODEL, [prefill.url], [decode.url])],
+                                 router_hint=False))
+
+    payload = chat_payload("no hint words", stream=False, max_tokens=2)
+    payload["kv_transfer_params"] = {"router": {"execution_role": "decode"}}
+    resp = await http.post(f"{router.url}/v1/chat/completions", json=payload)
+    assert resp.status_code == 200
+
+    d_seen = (await http.get(f"{decode.url}/last_request")).json()
+    assert d_seen == payload
+    p_seen = (await http.get(f"{prefill.url}/last_request")).json()
+    assert p_seen["kv_transfer_params"] == payload["kv_transfer_params"]
+    assert p_seen["max_tokens"] == 1 and p_seen["stream"] is False
+    # 关掉注入不等于保护：客户端伪造的 execution_role 照样直达 P，mismatch 探针记 1
+    assert (await stats(http, prefill))["router_hint_mismatch"] == 1
+
+
+def test_stamp_router_hint_owns_only_its_subkey():
+    """注入的所有权边界：替换 router 子键、保留同袋其他键、不改写入参。"""
+    from ucm_router.ports.engine_client import stamp_router_hint
+
+    original = {"model": "m", "kv_transfer_params": {"router": {"x": 1}, "peer": "p"}}
+    stamped = stamp_router_hint(original, "decode", "abc123")
+
+    assert stamped["kv_transfer_params"] == {
+        "peer": "p",
+        "router": {"execution_role": "decode", "request_id": "abc123",
+                   "kv_load": "prefetch_only"},
+    }
+    assert original["kv_transfer_params"]["router"] == {"x": 1}   # 入参未被改写
+
+    weird = stamp_router_hint({"kv_transfer_params": ["nope"]}, "prefill", "id1")
+    assert weird["kv_transfer_params"] == {
+        "router": {"execution_role": "prefill", "request_id": "id1",
+                   "kv_load": "store_only"}}

@@ -4,14 +4,22 @@
 # 演示内容（decode_dispatch=early，即 v4 理想路径）：
 #   第 1 次请求：D 到达时 KV 未就绪 → D 侧 Connector 逐块等待（观察 mock-decode 的 wait=N）
 #   第 2 次请求：相同 prompt 的 KV 块已全部就绪 → 直接命中（观察 hit=N、lookup_time 变短）
+#   末尾回读两腿收到的 kv_transfer_params.router，并展示引擎侧计数如何被 /metrics 透传
 #
 # 用法：bash scripts/demo.sh     （Ctrl-C 退出，进程自动清理）
+#       PYTHON=/path/to/python bash scripts/demo.sh   指定解释器
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-PY="${PYTHON:-python}"
+if [ -n "${PYTHON:-}" ]; then
+  PY="$PYTHON"
+elif command -v python3 >/dev/null 2>&1; then
+  PY=python3          # 只有 python3 的机器上 `python` 会直接 command not found
+else
+  PY=python
+fi
 MODEL="Qwen/Qwen2.5-7B-Instruct"
 ROUTER_PORT=9000
 STORE="${TMPDIR:-/tmp}/ucm-router-demo-store"
@@ -74,6 +82,7 @@ engine:
   connect_timeout_seconds: 5
   prefill_timeout_seconds: 120
   decode_timeout_seconds: 300
+  router_hint: true   # 两腿请求带 kv_transfer_params.router 声明
 
 health:
   interval_seconds: 5
@@ -88,7 +97,7 @@ done
 
 echo
 echo "======================================================================"
-echo " 第 1 次请求：KV 未就绪 → D 侧逐块等待（看终端里 mock-decode 的 wait=2）"
+echo " 第 1 次请求：KV 未就绪 → D 侧逐块等待（看 mock-decode 的 wait=，本例 blocks=3）"
 echo "======================================================================"
 curl -sN "http://127.0.0.1:${ROUTER_PORT}/v1/chat/completions" \
   -H "Content-Type: application/json" \
@@ -115,6 +124,14 @@ curl -sN "http://127.0.0.1:${ROUTER_PORT}/v1/chat/completions" \
     done
 
 echo
+echo "[demo] router 写给两腿的声明（kv_transfer_params.router，从引擎侧收到的 body 里读回）："
+for port in 7810 7820; do
+  printf "  :%s " "$port"
+  curl -s "http://127.0.0.1:${port}/last_request" \
+    | "$PY" -c 'import json,sys; b=json.load(sys.stdin); print(json.dumps((b.get("kv_transfer_params") or {}).get("router"), ensure_ascii=False))'
+done
+
+echo
 echo "[demo] 引擎计数（每个池各处理了一半请求；decode 的 hit/wait/recompute 反映 KV 状态）："
 for port in 7810 7811 7820 7821; do
   curl -s "http://127.0.0.1:${port}/stats"
@@ -127,7 +144,7 @@ curl -s "http://127.0.0.1:${ROUTER_PORT}/health"
 echo
 echo
 echo "[demo] /metrics（自有指标 + PD 分改名合并，节选）："
-curl -s "http://127.0.0.1:${ROUTER_PORT}/metrics" | grep -E "^pd_(requests_total|ttft_seconds_count|early_dispatch_lead_seconds_count|retries_total|prefill_duration_seconds_count|pool_healthy)" | head -12
+curl -s "http://127.0.0.1:${ROUTER_PORT}/metrics" | grep -E "^pd_(requests_total|ttft_seconds_count|early_dispatch_lead_seconds_count|retries_total|prefill_duration_seconds_count|pool_healthy|decode_mock_router_hint_seen_total)" | head -14
 echo
 echo "[demo] /admin/nodes（动态增删节点的查询入口）："
 curl -s "http://127.0.0.1:${ROUTER_PORT}/admin/nodes"

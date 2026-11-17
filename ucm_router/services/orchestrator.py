@@ -7,12 +7,15 @@ Decode 下发时序（decode_dispatch）：
 - sequential（默认）：P 的 prefill 完成（HTTP 响应返回）后再发 D。
   与 UCM 官方 toy_proxy_server.py 同语义，不依赖 D 侧就绪等待能力。
 - early：选完 P/D 后尽快发 D，不等 P 完成。D 侧 UCM Connector 负责
-  等待 KV 就绪（待验证前提①③）；P 失败则中止 D 请求。
+  等待 KV 就绪（依赖 README"Decode 下发时机"里列的三项前提）；P 失败则中止 D 请求。
 
 容错（fail-fast 之上的最小增强）：
-- 同池换节点重试一次，仅限可重试错误（连接级失败 / 后端 5xx）。
-  重试是安全的：UCM 集中式模式下 KV 块按哈希内容寻址，重复 prefill
-  写出一模一样的块文件，天然幂等。
+- 同池换节点重试，仅限可重试错误（连接级失败 / 后端 5xx），每轮排除上一个
+  失败的节点。重试是安全的：UCM 集中式模式下 KV 块按哈希内容寻址，重复
+  prefill 写出一模一样的块文件，天然幂等。
+  注意循环本身没有 hop 上限，终止依赖被动摘除把死节点移出轮询；探测间隔
+  取秒级时很快收敛，间隔很大而池里多个节点同时死掉时会绕圈（已知问题，
+  见 README 错误处理一节）。
 - 连接级失败触发被动健康摘除（不等探测周期）。
 - 在途到达上限返回 429，不排队（背压由客户端退避承担）。
 
@@ -343,7 +346,7 @@ class Orchestrator:
                 # recomputed 启发式：字节级透传不解析 SSE，仅做廉价子串门检
                 # （finish chunk 同时含 "stop_reason" 与 "recomputed"）。
                 # 误报需要模型正文恰好生成 JSON 字面量，可忽略；这正是
-                # D 侧 KV 等待超时回退重算的信号（博文前提①③的失败率观测点）。
+                # D 侧 KV 等待超时回退重算的信号（就绪等待与兜底那两条前提的失败率观测点）。
                 if not recomputed_seen and b'"stop_reason"' in chunk and b"recomputed" in chunk:
                     recomputed_seen = True
                     self._metrics.recomputed.inc({"model": session.model})

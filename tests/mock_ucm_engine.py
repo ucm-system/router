@@ -5,11 +5,16 @@
 2. 去中心化，无 master server（本文件不含任何中心化组件）；
 3. Prefetch 无独立 RPC，由 Decode 请求到达触发 D 侧逐块 lookup。
 
-并模拟 v4 依赖的 D 侧就绪等待（待验证前提①③的 mock 版）：
+并模拟 v4 依赖的 D 侧就绪等待（三项前提见 README 的"Decode 下发时机"）：
 - P 写 KV：先写数据文件，延迟 --ready-delay-ms 后补 .ready 标记，
   模拟"哈希文件可见 ≠ KV 可完整读取"的时间差；
 - D 逐块检查 .ready，未就绪则轮询等待（Connector 就绪等待能力），
   等待超时则回退本地重算（兜底路径，优化路径失效不失败）。
+
+同时扮演 router 声明的消费方（connector 侧）：读 kv_transfer_params.router，
+计数 router_hints_seen，声明角色与本实例不符时计 router_hint_mismatch，
+两者经 /stats 与 /metrics 暴露（router 的 /metrics 会改名透传）。收到的
+完整 body 由 GET /last_request 回吐，供 e2e 断言 router 的请求口径。
 
 用法：
     python tests/mock_ucm_engine.py --role prefill --port 7810 --store DIR --model M
@@ -49,7 +54,7 @@ class EngineSettings:
     prefill_base_ms: int = 200     # P：prefill 固定开销
     prefill_per_token_ms: int = 3  # P：每 token 计算开销
     ready_delay_ms: int = 150      # P：数据文件可见到 .ready 标记出现的时间差
-    kv_wait_timeout_ms: int = 5000     # D：单块就绪等待上限（前提①的就绪等待）
+    kv_wait_timeout_ms: int = 5000     # D：单块就绪等待上限（Connector 的就绪等待能力）
     recompute_base_ms: int = 300       # D：就绪等待失败后本地重算的兜底开销
     decode_token_delay_ms: int = 20    # D：每个输出 token 间隔
     first_token_delay_ms: int = 0      # D：首个 chunk 前的延迟（测 preopen 用）
@@ -66,6 +71,8 @@ class Stats:
     blocks_waited: int = 0     # 经轮询等待后才就绪（D 侧 Connector 等待生效）
     blocks_recomputed: int = 0  # 等待超时，回退本地重算
     last_ttft_ms: float = 0.0
+    router_hints_seen: int = 0
+    router_hint_mismatch: int = 0   # 声明的 execution_role 与本实例承担的角色不符
 
 
 class SharedStore:
@@ -135,6 +142,7 @@ def output_tokens(max_tokens: int | None) -> list[str]:
 def build_app(settings: EngineSettings) -> FastAPI:
     store = SharedStore(settings.store)
     stats = Stats()
+    last_request: dict = {}   # 最近一次收到的生成请求 body（供 router 请求口径断言）
     app = FastAPI(title=f"mock-{settings.role}-engine")
 
     # --- 管理端点 -------------------------------------------------------
@@ -152,6 +160,15 @@ def build_app(settings: EngineSettings) -> FastAPI:
             **{k: v for k, v in stats.__dict__.items()},
         }
 
+    @app.get("/last_request")
+    async def get_last_request() -> dict:
+        """最近一次收到的 OpenAI 请求 body。
+
+        存在的意义：router 注入的字段（kv_transfer_params.router）只能从
+        引擎侧看到，透传口径要在这里断言，而不是靠读 router 代码推断。
+        """
+        return dict(last_request)
+
     @app.get("/metrics")
     async def prometheus_metrics() -> Response:
         """极简 Prometheus exposition，供 router 的 /metrics 改名合并透传。"""
@@ -165,6 +182,12 @@ def build_app(settings: EngineSettings) -> FastAPI:
             "# HELP mock_process_uptime_seconds mock engine uptime",
             "# TYPE mock_process_uptime_seconds gauge",
             f"mock_process_uptime_seconds {time.monotonic() - started_at:.3f}",
+            "# HELP mock_router_hint_seen_total router declarations consumed by this engine",
+            "# TYPE mock_router_hint_seen_total counter",
+            f"mock_router_hint_seen_total {stats.router_hints_seen}",
+            "# HELP mock_router_hint_mismatch_total declared execution_role unlike this role",
+            "# TYPE mock_router_hint_mismatch_total counter",
+            f"mock_router_hint_mismatch_total {stats.router_hint_mismatch}",
         ]
         return Response(
             content="\n".join(lines) + "\n",
@@ -192,7 +215,27 @@ def build_app(settings: EngineSettings) -> FastAPI:
     async def completions(payload: dict) -> Response:
         return await generate(payload, chat=False)
 
+    def note_router_hint(payload: dict) -> dict | None:
+        """读 kv_transfer_params.router 并计数，扮演 connector 侧的消费方。
+
+        真实 UCM Connector 采纳这个子键后，"提示有没有被吃到"应当在引擎侧
+        计数、经自己的 /metrics 暴露，由 router 改名透传（见 _merge 逻辑）；
+        mock 在这里把同一条路走通，Router 不必解析响应字节。
+        声明的角色与本实例承担的角色不符时计入 mismatch，这是 router 的 bug 探针。
+        """
+        raw = payload.get("kv_transfer_params")
+        hint = raw.get("router") if isinstance(raw, dict) else None
+        if not isinstance(hint, dict):
+            return None
+        stats.router_hints_seen += 1
+        if hint.get("execution_role") != settings.role:
+            stats.router_hint_mismatch += 1
+        return hint
+
     async def generate(payload: dict, chat: bool) -> Response:
+        last_request.clear()
+        last_request.update(payload)   # 原样记下收到的 body
+        note_router_hint(payload)
         prompt = extract_prompt(payload, chat)
         hashes = block_hashes(settings.model, prompt, settings.block_tokens)
         if settings.role == "prefill":
@@ -256,10 +299,15 @@ def build_app(settings: EngineSettings) -> FastAPI:
                 await asyncio.sleep(settings.recompute_base_ms / 1000)
         first_delay = time.monotonic() - started
         stats.last_ttft_ms = first_delay * 1000
+        raw = payload.get("kv_transfer_params")
+        hint = raw.get("router") if isinstance(raw, dict) else None
+        hint_tag = (f"{hint.get('execution_role')}/{hint.get('kv_load')}"
+                    if isinstance(hint, dict) else "-")
         print(
             f"[mock-decode] prompt={len(prompt.split())}tok blocks={len(hashes)} "
             f"hit={hit_count} wait={waited} "
-            f"recompute={recomputed} lookup_time={first_delay * 1000:.0f}ms",
+            f"recompute={recomputed} lookup_time={first_delay * 1000:.0f}ms "
+            f"router_hint={hint_tag}",
             flush=True,
         )
 

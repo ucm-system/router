@@ -74,6 +74,7 @@ def make_router(
     health_interval: float = 3600.0,
     max_inflight_per_node: int = 0,
     session_affinity: bool = False,
+    router_hint: bool = True,
 ) -> ThreadServer:
     from ucm_router.config import (
         EngineConfig,
@@ -90,7 +91,8 @@ def make_router(
         decode_dispatch=decode_dispatch,
         engine=EngineConfig(connect_timeout_seconds=2.0,
                             prefill_timeout_seconds=20.0,
-                            decode_timeout_seconds=30.0),
+                            decode_timeout_seconds=30.0,
+                            router_hint=router_hint),
         health=HealthConfig(interval_seconds=health_interval, timeout_seconds=1.0),
         routing=RoutingConfig(
             serving_groups=[

@@ -1,7 +1,10 @@
 """错误模型。
 
-失败语义是最基础的 fail-fast，不重试：重试意味着重复 prefill，涉及幂等性
-设计，不属于"最基础"范围。错误码区分 P / D，客户端据此知道哪个池出了问题。
+失败语义：过载（池空 / 在途到上限）与客户端错误立即返回，不退避、不排队；
+连接级失败与后端 5xx 会在同池内换一个节点重试（UCM 集中式模式下 KV 块按内容
+哈希落盘，同一个 prompt 重做 prefill 幂等，见 orchestrator._call_with_failover）。
+读超时不重试：客户端已经等满超时，再换节点只会更久。错误码区分 P / D，
+客户端据此知道哪个池出了问题。
 """
 
 from __future__ import annotations
@@ -93,6 +96,7 @@ class DecodeRequestFailed(_BackendRequestFailed):
 
 
 class NodeUnhealthy(RouterError):
+    """预留：探测未通过的待加节点。当前 admin 走 waiting 队列轮询，不抛此错。"""
     http_status = 503
     code = NODE_UNHEALTHY
 

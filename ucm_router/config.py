@@ -25,11 +25,14 @@ class ServerConfig:
 
 @dataclass
 class EngineConfig:
-    """对后端引擎的 HTTP 超时。"""
+    """对后端引擎的 HTTP 超时与请求口径。"""
 
     connect_timeout_seconds: float = 5.0
     prefill_timeout_seconds: float = 120.0
     decode_timeout_seconds: float = 300.0
+    # 在 kv_transfer_params.router 里声明本次编排（角色 / request_id / kv_load）。
+    # 关掉即完全透传 decode body，用于和 connector 侧对齐前的回退。
+    router_hint: bool = True
 
 
 @dataclass

@@ -1,7 +1,9 @@
 """Router 自有指标：手写的极简 Prometheus 文本 exposition（无第三方依赖）。
 
-边界：router 只报自己视角的事——选路、请求生命周期、耗时、错误。
-KV 命中 / 等待 / 重算是 UCM Connector 的知识，这里一律不出现。
+边界：router 只报自己视角的事——选路、请求生命周期、耗时、错误。KV 命中与
+等待属于 UCM Connector 的知识，router 不自己统计，而是抓取实例 /metrics 改名
+透传（见 metrics_proxy）；唯一近似例外是 pd_recomputed_total，它取自引擎响应的
+stop_reason 信号，router 只识别并计数，不判断缓存状态。
 """
 
 from __future__ import annotations

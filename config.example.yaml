@@ -9,10 +9,11 @@ server:
 
 # Decode 请求下发时序：
 #   sequential — P 的 prefill 完成（HTTP 响应返回）后，再把 Decode 请求发给 D。
-#                与 UCM 官方 toy_proxy_server.py 同语义，正确性最稳妥。
+#                与 UCM 官方 toy_proxy_server.py 同语义（差异只有 engine.router_hint
+#                注入的那条声明，UCM 忽略未知键，行为等价）。
 #   early      — 选完 P/D 后尽快把 Decode 请求发给 D，不等 P 完成；
 #                KV 就绪等待发生在 D 侧 UCM Connector（v4 理想路径，
-#                依赖 Connector 的请求级就绪等待能力，见 README"待验证前提"）。
+#                依赖 Connector 的请求级就绪等待能力，见 README"Decode 下发时机"）。
 decode_dispatch: sequential
 
 # ServingGroup：一组 KV 兼容的 P/D 实例。模型版本、Tokenizer、KV 数据类型、
@@ -33,11 +34,18 @@ routing:
       decode:
         - "http://127.0.0.1:7801"
 
-# 对后端引擎的 HTTP 超时（OpenAI 兼容接口）
+# 对后端引擎的 HTTP 超时与请求口径（OpenAI 兼容接口）
 engine:
   connect_timeout_seconds: 5
   prefill_timeout_seconds: 120   # 等 P 完成 prefill 的上限
   decode_timeout_seconds: 300    # decode 流上相邻字节间的空闲上限
+  # 在两腿请求的 kv_transfer_params.router 里声明本次编排：
+  #   execution_role prefill|decode、request_id（与 X-Request-Id 同源）、
+  #   kv_load store_only|prefetch_only。kv_both 下 P/D 启动参数相同，
+  #   角色只能由 Router 声明；header 到不了 connector，所以走 body。
+  #   Router 只接管 router 这个子键，客户端伪造值以这里写入的为准被覆盖。
+  #   false = 不注入，decode body 完全按客户端原样透传（回退开关）。
+  router_hint: true
 
 # 周期探测各节点 GET /health；不健康节点移出轮询，恢复后加回
 health:

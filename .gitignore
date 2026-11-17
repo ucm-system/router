@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# 本项目
+# 演示脚本每次运行覆写的临时 router 配置（scripts/demo.sh）
+demo-router.generated.yaml
+# 本地运行配置：由 config.example.yaml 复制，含环境相关的实例地址
+config.yaml
